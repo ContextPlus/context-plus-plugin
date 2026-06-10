@@ -1,6 +1,6 @@
 {
-  "mcp_base_url": "https://mcp.cpdev.circuitdreams.net",
-  "tds_base_url": "https://tds.cpdev.circuitdreams.net",
+  "mcp_base_url": "https://mcp.context-plus.com",
+  "tds_base_url": "https://tds.context-plus.com",
   "timeouts": {
     "inject": 240,
     "post_turn_triage": 5,
