@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "context-plus",
-      "source": ".",
+      "source": "./plugins/context-plus",
       "description": "Context+ memory system: query-planner memory injection hooks, post-turn triage, dynamic agents, and workflows for Claude Code."
     }
   ]
