@@ -336,7 +336,9 @@ def main() -> int:
 
     try:
         event = json.loads(sys.stdin.read() or "{}")
-    except json.JSONDecodeError as exc:
+        if not isinstance(event, dict):
+            event = {}
+    except (json.JSONDecodeError, ValueError) as exc:
         print(f"post_turn_triage: stdin parse failed: {exc}", file=sys.stderr)
         return 0
 
