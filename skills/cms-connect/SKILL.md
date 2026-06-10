@@ -36,10 +36,15 @@ Run the one-shot helper below via Bash. It:
    POSTs it to `{mcp_base_url}/workflows/list` with headers
    `Authorization: Bearer <api_key>` and `X-CMS-Project-Id: <project_id>`.
 3. Branches on the response with DISTINCT messages:
-   - **200** → write `$CLAUDE_PROJECT_DIR/.claude/cms.config.json` (creating
-     `.claude/` if missing) containing EXACTLY
-     `{"project_id": ..., "api_key": ...}`, atomically (temp file +
-     `os.replace`), `chmod 0600`, then print success + a reminder to run
+   - **200** → require the body to be JSON carrying a `workflows` key (cheap
+     insurance against a malformed 200; an explicitly malformed body blocks
+     the write with `unexpected response shape from /workflows/list; not
+     writing config`). On a well-formed 200, write
+     `$CLAUDE_PROJECT_DIR/.claude/cms.config.json` (creating `.claude/` if
+     missing) containing EXACTLY `{"project_id": ..., "api_key": ...}`,
+     atomically (temp file `chmod 0600` then `os.replace`, which preserves the
+     temp's mode; the temp is removed on any write failure so no secret-bearing
+     `.tmp` is orphaned), then print success + a reminder to run
      `/reload-plugins` (or restart) to activate.
    - **401** → `API key rejected (invalid key)`, no write.
    - **403** → `key not authorized for project <project_id>`, no write.
@@ -57,15 +62,27 @@ cache.
 python3 -c '
 import importlib.util, json, os, sys, urllib.error, urllib.request
 
-_project_id = sys.argv[1]
-_api_key = sys.argv[2]
+# Length-guard argv so a missing arg degrades cleanly to the usage message
+# below (the empty-string "missing arg -> usage, no write" guard) instead of
+# raising IndexError/traceback before that guard can fire.
+_project_id = sys.argv[1] if len(sys.argv) > 1 else ""
+_api_key    = sys.argv[2] if len(sys.argv) > 2 else ""
 if not (_project_id and _api_key):
     print("cms-connect error: usage /context-plus:cms-connect <project_id> <api_key>")
     sys.exit(0)
 
 # Resolve mcp_base_url from the plugin tier (no project config required).
-_spec = importlib.util.spec_from_file_location("cms_config", "${CLAUDE_PLUGIN_ROOT}/hooks/cms_config.py")
-_m = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_m)
+# Env-var-first path resolution: read CLAUDE_PLUGIN_ROOT from the environment,
+# falling back to the harness-substituted literal. Works whether the harness
+# exports the env var OR inline-substitutes the ${CLAUDE_PLUGIN_ROOT} token in
+# this SKILL.md content. A load failure degrades to the config-error line.
+try:
+    _root = os.environ.get("CLAUDE_PLUGIN_ROOT") or "${CLAUDE_PLUGIN_ROOT}"
+    _spec = importlib.util.spec_from_file_location("cms_config", os.path.join(_root, "hooks", "cms_config.py"))
+    _m = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_m)
+except Exception as exc:
+    print(f"cms-connect error: could not load plugin config ({exc})")
+    sys.exit(0)
 _cfg, _err = _m.load_config()
 if _cfg is None:
     print(f"cms-connect error: could not load plugin config ({_err})")
@@ -92,10 +109,11 @@ _req = urllib.request.Request(
 )
 
 _status = None
+_resp_body = b""
 try:
     with urllib.request.urlopen(_req, timeout=30) as r:
         _status = r.getcode()
-        r.read()
+        _resp_body = r.read()
 except urllib.error.HTTPError as e:
     _status = e.code
 except Exception:
@@ -103,19 +121,38 @@ except Exception:
     sys.exit(0)
 
 if _status == 200:
+    # FIX 7 — a bare HTTP 200 from /workflows/list is sufficient auth proof
+    # (the MCP auth middleware returns 403 project_not_granted for a key not
+    # scoped to the project). As cheap insurance, require the 200 body to be
+    # JSON carrying a "workflows" key before writing. Lenient: only an
+    # explicitly malformed 200 blocks the write.
+    try:
+        _parsed = json.loads(_resp_body) if _resp_body else None
+    except Exception:
+        _parsed = None
+    if not (isinstance(_parsed, dict) and "workflows" in _parsed):
+        print("unexpected response shape from /workflows/list; not writing config")
+        sys.exit(0)
     _proj_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     _claude_dir = os.path.join(_proj_dir, ".claude")
     _dest = os.path.join(_claude_dir, "cms.config.json")
+    _tmp = _dest + ".tmp"
     try:
         os.makedirs(_claude_dir, exist_ok=True)
         _payload = json.dumps({"project_id": _project_id, "api_key": _api_key}, indent=2) + "\n"
-        _tmp = _dest + ".tmp"
         with open(_tmp, "w", encoding="utf-8") as f:
             f.write(_payload)
+        # chmod the secret-bearing temp BEFORE the replace. os.replace
+        # preserves the temp inode + mode, so no post-replace chmod is
+        # needed. On ANY failure, remove the temp so no 0600 .tmp holding
+        # the api_key is left orphaned.
         os.chmod(_tmp, 0o600)
         os.replace(_tmp, _dest)
-        os.chmod(_dest, 0o600)
     except Exception as exc:
+        try:
+            os.remove(_tmp)
+        except OSError:
+            pass
         print(f"cms-connect error: validated but failed to write {_dest}: {exc}")
         sys.exit(0)
     print(f"Connected to Context+ — wrote {_dest}")
@@ -138,9 +175,13 @@ else:
 - Pass `project_id` and `api_key` to the helper as raw scalar shell arguments
   (`$0`, `$1`). NEVER assemble the request JSON in the shell — build it in
   Python.
-- Write the project config ONLY on a clean 200. Every other status (and any
-  transport failure) prints its distinct message and writes NOTHING.
-- The write is atomic (temp file + `os.replace`) and the file is `chmod 0600`.
+- Write the project config ONLY on a clean, well-formed 200 (body parses as
+  JSON and carries a `workflows` key). Every other status (and any transport
+  failure, and a malformed 200) prints its distinct message and writes NOTHING.
+- The write is atomic: write a temp file, `chmod 0600` the temp, then
+  `os.replace` it onto the destination (the replace preserves the temp's mode,
+  so no redundant post-replace chmod). On any write failure the temp is removed
+  so no secret-bearing `.tmp` is left behind.
 - Resolve the write location from `$CLAUDE_PROJECT_DIR` (fallback cwd). Never
   write into the plugin cache.
 - `mcp_base_url` comes from the shared merged loader's plugin tier — this skill
