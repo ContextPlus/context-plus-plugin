@@ -31,12 +31,22 @@ single-line envelope and never raises a traceback. Two distinct failure shapes:
 
 ```bash
 python3 -c '
-import importlib.util, json, sys, urllib.error, urllib.request
+import importlib.util, json, os, sys, urllib.error, urllib.request
 
 _TIMEOUT_FALLBACK_S = 30.0
 
-_spec = importlib.util.spec_from_file_location("cms_config", "${CLAUDE_PLUGIN_ROOT}/hooks/cms_config.py")
-_m = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_m)
+try:
+    # Env-var-first path resolution: read CLAUDE_PLUGIN_ROOT from the
+    # environment, falling back to the harness-substituted literal. Works
+    # whether the harness exports the env var OR inline-substitutes the
+    # ${CLAUDE_PLUGIN_ROOT} token in this SKILL.md content. A load failure
+    # is caught and printed as the config-error envelope (no traceback).
+    _root = os.environ.get("CLAUDE_PLUGIN_ROOT") or "${CLAUDE_PLUGIN_ROOT}"
+    _spec = importlib.util.spec_from_file_location("cms_config", os.path.join(_root, "hooks", "cms_config.py"))
+    _m = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_m)
+except Exception as exc:
+    print(json.dumps({"error": True, "status": None, "detail": f"config loader unavailable: {exc}"}))
+    sys.exit(0)
 _cfg, _err = _m.load_config()
 if _cfg is None:
     print(json.dumps({"error": True, "status": None, "detail": "config not found at .claude/cms.config.json"}))

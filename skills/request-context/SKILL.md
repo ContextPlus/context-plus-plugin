@@ -31,12 +31,22 @@ Run a one-shot `python3 -c '...'` via Bash:
 
 ```bash
 python3 -c '
-import importlib.util, json, sys, urllib.error, urllib.request, uuid
+import importlib.util, json, os, sys, urllib.error, urllib.request, uuid
 
 _TIMEOUT_FALLBACK_S = 180
 
-_spec = importlib.util.spec_from_file_location("cms_config", "${CLAUDE_PLUGIN_ROOT}/hooks/cms_config.py")
-_m = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_m)
+try:
+    # Env-var-first path resolution: read CLAUDE_PLUGIN_ROOT from the
+    # environment, falling back to the harness-substituted literal. Works
+    # whether the harness exports the env var OR inline-substitutes the
+    # ${CLAUDE_PLUGIN_ROOT} token in this SKILL.md content. A load failure
+    # is caught and degrades to the skill config-error line (no traceback).
+    _root = os.environ.get("CLAUDE_PLUGIN_ROOT") or "${CLAUDE_PLUGIN_ROOT}"
+    _spec = importlib.util.spec_from_file_location("cms_config", os.path.join(_root, "hooks", "cms_config.py"))
+    _m = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_m)
+except Exception:
+    sys.stdout.write("request-context error: config not found at .claude/cms.config.json")
+    sys.exit(0)
 _cfg, _err = _m.load_config()
 if _cfg is None:
     sys.stdout.write("request-context error: config not found at .claude/cms.config.json")
@@ -52,8 +62,10 @@ except Exception:
     sys.stdout.write("request-context error: config not found at .claude/cms.config.json")
     sys.exit(0)
 
-agent_session_id = sys.argv[1]
-request_text = sys.argv[2]
+# Length-guard argv so a missing arg degrades to the "both required" error
+# path below instead of raising IndexError/traceback before the guard fires.
+agent_session_id = sys.argv[1] if len(sys.argv) > 1 else ""
+request_text = sys.argv[2] if len(sys.argv) > 2 else ""
 
 # m3 (hook-runtime-adversary): refuse an empty request rather than
 # round-tripping to the planner with a blank prompt. Soft-exit so the
