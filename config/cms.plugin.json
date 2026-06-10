@@ -1,0 +1,15 @@
+{
+  "mcp_base_url": "https://mcp.cpdev.circuitdreams.net",
+  "tds_base_url": "https://tds.cpdev.circuitdreams.net",
+  "timeouts": {
+    "inject": 240,
+    "post_turn_triage": 5,
+    "request_context": 180,
+    "call_agent_tds": 30,
+    "reset_session": 10,
+    "workflow": 30
+  },
+  "post_turn_triage": {
+    "fire_on_subagent_stop": false
+  }
+}
