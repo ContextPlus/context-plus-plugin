@@ -43,6 +43,10 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cms_config import load_config  # noqa: E402
 
+# Default reset_session timeout used when ``timeouts.reset_session`` is missing
+# or the ``timeouts`` block is not a dict (consistency with post_turn_triage).
+_DEFAULT_RESET_TIMEOUT = 10.0
+
 
 def _debug(msg: str) -> None:
     """Print a diagnostic to stderr ONLY when RESET_HOOK_DEBUG is set."""
@@ -69,11 +73,12 @@ def main() -> int:
         mcp_url = f"{mcp_base_url}/inject/reset_session"
         api_key = config["api_key"]
         project_id = config["project_id"]
-        # float() coercion INSIDE the swallow-everything guard (reviewer
-        # m1): a hand-edited non-numeric timeout degrades to exit 0 here
-        # rather than being passed to urlopen() where the failure mode is
-        # murkier. Timeout comes from the new timeouts.reset_session key.
-        timeout_s = float(config["timeouts"]["reset_session"])
+        # Timeout resolved defensively (consistency with post_turn_triage):
+        # a missing key or non-dict ``timeouts`` block falls back to the
+        # module default rather than raising. Still inside the
+        # swallow-everything try, so a non-numeric value also degrades softly.
+        _timeouts = config.get("timeouts") if isinstance(config.get("timeouts"), dict) else {}
+        timeout_s = float(_timeouts.get("reset_session", _DEFAULT_RESET_TIMEOUT))
         if not (mcp_base_url and api_key and project_id):
             _debug("missing required config value")
             return 0

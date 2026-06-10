@@ -33,6 +33,11 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cms_config import load_config  # noqa: E402
 
+# Default inject timeout used when ``timeouts.inject`` is missing or the
+# ``timeouts`` block is not a dict. A missing timeout must NOT be conflated
+# with a not-connected project (see main()'s defensive resolution).
+_DEFAULT_INJECT_TIMEOUT = 240.0
+
 # Fixed loud-warning literal (M-1): NEVER LLM-composed. Surfaced on stdout
 # when the config is missing/malformed so the broken state is visible to the
 # user rather than silently swallowed.
@@ -54,26 +59,37 @@ def main() -> int:
         print(_CONFIG_BROKEN_WARNING)
         return 0
 
-    try:
-        mcp_base_url = str(config["mcp_base_url"]).rstrip("/")
-        mcp_url = f"{mcp_base_url}/inject/query_planner"
-        api_key = config["api_key"]
-        project_id = config["project_id"]
-        # float() coercion (not a bare read): a hand-edited non-numeric
-        # timeout (e.g. "180" or null) raises TypeError/ValueError here and
-        # degrades to the loud warning, rather than being passed to urlopen()
-        # inside the network try where it would be silently swallowed.
-        timeout_s = float(config["timeouts"]["inject"])
-        # Partial/missing keys are treated as malformed for the needed value
-        # → same loud-warning degradation as a wholly missing config.
-        if not (mcp_base_url and api_key and project_id):
-            raise KeyError("missing required config value")
-    except (KeyError, TypeError, ValueError):
+    # Resolve the connection triple via .get() so a MISSING timeouts.inject
+    # key can never masquerade as a not-connected project. ONLY a missing
+    # api_key / project_id / mcp_base_url triggers the loud not-connected
+    # warning; a missing / non-dict timeouts block falls back to the default.
+    mcp_base_url = str(config.get("mcp_base_url") or "").rstrip("/")
+    mcp_url = f"{mcp_base_url}/inject/query_planner"
+    api_key = config.get("api_key")
+    project_id = config.get("project_id")
+    # Partial/missing connection values are treated as not-connected →
+    # loud-warning degradation, same as a wholly missing config. This is the
+    # SOLE not-connected trigger.
+    if not (mcp_base_url and api_key and project_id):
         print(_CONFIG_BROKEN_WARNING)
         return 0
 
+    # Timeout resolved defensively and INDEPENDENTLY of the not-connected
+    # check: a missing key or non-dict ``timeouts`` block falls back to the
+    # module default rather than reporting "not connected". A hand-edited
+    # non-numeric value falls back too (float() raises TypeError/ValueError).
     try:
-        event = json.loads(sys.stdin.read())
+        _timeouts = config.get("timeouts") if isinstance(config.get("timeouts"), dict) else {}
+        timeout_s = float(_timeouts.get("inject", _DEFAULT_INJECT_TIMEOUT))
+    except (TypeError, ValueError):
+        timeout_s = _DEFAULT_INJECT_TIMEOUT
+
+    try:
+        # Mirror the triage hook's stdin hardening: empty / non-dict stdin
+        # degrades identically across hooks (default to {} → empty fields).
+        event = json.loads(sys.stdin.read() or "{}")
+        if not isinstance(event, dict):
+            event = {}
         body = json.dumps(
             {
                 "project_id": project_id,
