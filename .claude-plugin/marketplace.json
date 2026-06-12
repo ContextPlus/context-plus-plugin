@@ -1,13 +1,13 @@
 {
   "name": "context-plus",
   "owner": {
-    "name": "Context+"
+    "name": "ContextPlus"
   },
   "plugins": [
     {
       "name": "context-plus",
       "source": "./plugins/context-plus",
-      "description": "Context+ memory system: query-planner memory injection hooks, post-turn triage, dynamic agents, and workflows for Claude Code."
+      "description": "ContextPlus memory system: query-planner memory injection hooks, post-turn triage, dynamic agents, and workflows for Claude Code."
     }
   ]
 }

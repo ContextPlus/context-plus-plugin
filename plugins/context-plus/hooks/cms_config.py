@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Shared stdlib loader for the Context+ TWO-TIER plugin/project config.
+"""Shared stdlib loader for the ContextPlus TWO-TIER plugin/project config.
 
-This loader assembles the effective Context+ configuration by merging two
+This loader assembles the effective ContextPlus configuration by merging two
 tiers:
 
 * PLUGIN tier (non-secret defaults shipped with the plugin):

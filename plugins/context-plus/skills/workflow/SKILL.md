@@ -9,7 +9,7 @@ You are loading an orchestrator workflow from the V2 `memory_core.workflows` tab
 ## Project context (from config)
 
 The MCP base URL, API key, project_id, and timeout are read at runtime from
-the shared Context+ config loader, which merges the plugin's non-secret
+the shared ContextPlus config loader, which merges the plugin's non-secret
 `config/cms.plugin.json` with the project's `.claude/cms.config.json`
 (project values win). This skill reaches the workflows surface over HTTP — a
 direct `urllib` POST to the MCP `/workflows/*` routes with the user PAT —

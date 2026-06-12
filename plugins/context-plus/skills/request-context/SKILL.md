@@ -9,7 +9,7 @@ You are the mid-task context retrieval skill for V2 dynamic agents. A working dy
 ## Project context (from config)
 
 The MCP base URL, API key, project_id, and request timeout are read at
-runtime from the shared Context+ config loader, which merges the plugin's
+runtime from the shared ContextPlus config loader, which merges the plugin's
 non-secret `config/cms.plugin.json` with the project's
 `.claude/cms.config.json` (project values win). Nothing project-specific is
 hardcoded in this skill.
