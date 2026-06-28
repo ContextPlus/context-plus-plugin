@@ -34,9 +34,11 @@ Implementation notes
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -48,6 +50,24 @@ from cms_config import load_config  # noqa: E402
 
 # Fallback used only when the config omits the post_turn_triage timeout.
 _DEFAULT_TIMEOUT = 5.0
+
+# Transcript settle-wait (config-overridable via timeouts.transcript_settle_*).
+# A Stop hook can fire and read the transcript BEFORE Claude Code has flushed
+# the final assistant message(s) to the .jsonl — notably on the WSL /mnt/c
+# filesystem, whose write-lag makes this reliable rather than occasional. The
+# result is a truncated llm_response (everything after the first tool call is
+# lost), which strips the grounding the post-turn agents need. We poll the
+# transcript until the turn is SETTLED (see _turn_is_settled) before parsing,
+# capped so an interrupted turn can never hang the hook.
+_DEFAULT_SETTLE_MAX_S = 3.0
+_DEFAULT_SETTLE_POLL_S = 0.25
+
+# Assistant ``stop_reason`` values that mean the turn genuinely finished. The
+# odd one out is ``"tool_use"``: it means the model will CONTINUE after a tool
+# result, so a transcript whose trailing assistant message carries it is still
+# mid-flight. A terminal reason (or an absent reason on transcripts that don't
+# record it) is treated as settled.
+_TERMINAL_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "max_tokens"})
 
 # The master toggle for whether the hook fires on ``SubagentStop`` events
 # now lives in .claude/cms.config.json under
@@ -150,8 +170,143 @@ def _extract_result_text(content: object) -> str:
     return ""
 
 
+def _finite_float(value: object, default: float) -> float:
+    """Coerce a config value to a NON-NEGATIVE, FINITE float, else ``default``.
+
+    ``json.loads`` accepts the bare tokens ``Infinity`` / ``NaN``, which survive
+    a plain ``float(...)`` + ``(TypeError, ValueError)`` guard. An infinite or
+    NaN settle cap would make the poll loop's ``remaining <= 0`` break
+    unreachable — turning the "never hang the hook" guarantee into an unbounded
+    poll. Reject non-finite (and negative) values to the sane default.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(f) or f < 0:
+        return default
+    return f
+
+
+def _load_entries(transcript_path: str) -> list[dict]:
+    """Read + JSON-parse a transcript into a list of entry dicts.
+
+    Returns ``[]`` for a missing path, an unreadable file, or a malformed
+    line-stream — every caller degrades the same way (empty turn) so a bad
+    transcript never raises out of the Stop hook.
+    """
+    if not transcript_path or not os.path.exists(transcript_path):
+        return []
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"post_turn_triage: transcript read failed: {exc}", file=sys.stderr)
+        return []
+
+
+def _find_last_user_idx(entries: list[dict]) -> int | None:
+    """Index of the last REAL user prompt (skipping tool_result messages and
+    entirely harness/hook-injected user-role content). ``None`` if there is no
+    genuine typed prompt in the transcript yet."""
+    for i in range(len(entries) - 1, -1, -1):
+        entry = entries[i]
+        if not isinstance(entry, dict):
+            continue
+        msg = entry.get("message") or {}
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if msg.get("role") == "user" and _is_real_user_message(content):
+            if not _strip_injected_blocks(_extract_text(content)):
+                # ENTIRELY harness/hook-injected content (task-notification,
+                # system-reminder, or our injected memory) — not a real
+                # prompt. Keep walking back to the user's actual typed message.
+                continue
+            return i
+    return None
+
+
+def _turn_is_settled(entries: list[dict]) -> bool:
+    """True if the most recent turn looks fully written to disk.
+
+    A Stop hook can read the transcript before Claude Code has flushed the
+    final assistant message. Two observable symptoms of an unflushed read:
+
+      * the assistant's reply to the last user prompt isn't present yet
+        (no assistant message AFTER the last user prompt), or
+      * the trailing assistant message carries a NON-terminal ``stop_reason``
+        (e.g. ``"tool_use"`` or ``"pause_turn"``), meaning the model will
+        CONTINUE the turn after a tool/server result (mid-turn).
+
+    Either → not settled. Only a terminal stop_reason (``_TERMINAL_STOP_REASONS``)
+    — or an absent one on transcripts that don't record it — is treated as
+    settled. When there is no real user prompt yet, there is nothing to wait
+    for (settled → parser returns empties).
+    """
+    last_user_idx = _find_last_user_idx(entries)
+    if last_user_idx is None:
+        return True
+    last_assistant_msg: dict | None = None
+    for entry in entries[last_user_idx + 1:]:
+        if not isinstance(entry, dict):
+            continue
+        msg = entry.get("message") or {}
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            last_assistant_msg = msg
+    if last_assistant_msg is None:
+        return False
+    # Settled only on a TERMINAL stop_reason (allowlist) — or an absent reason
+    # on transcripts that don't record it. An allowlist (not a "!= tool_use"
+    # denylist) makes every OTHER non-terminal reason fail SAFE: e.g. the API's
+    # "pause_turn" (server-tool continuation) means the model will continue the
+    # turn, so we wait for the continuation instead of capturing a truncated
+    # pre-continuation llm_response — the exact grounding-loss this guards.
+    sr = last_assistant_msg.get("stop_reason")
+    return sr is None or sr in _TERMINAL_STOP_REASONS
+
+
+def _read_settled_entries(
+    transcript_path: str, *, max_wait_s: float, poll_interval_s: float
+) -> list[dict]:
+    """Load the transcript, polling until the turn is settled or the cap hits.
+
+    Fast path: an already-settled transcript returns on the first read with
+    zero added latency. Otherwise re-read every ``poll_interval_s`` until
+    ``_turn_is_settled`` or ``max_wait_s`` elapses, then return best-effort
+    (a genuinely interrupted turn that ends on a real tool_use must never hang
+    the hook). A non-positive cap/interval disables the wait entirely.
+    """
+    entries = _load_entries(transcript_path)
+    if max_wait_s <= 0 or poll_interval_s <= 0:
+        return entries
+    deadline = time.monotonic() + max_wait_s
+    while not _turn_is_settled(entries):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(
+                "post_turn_triage: transcript not settled within "
+                f"{max_wait_s}s — capturing best-effort turn",
+                file=sys.stderr,
+            )
+            break
+        time.sleep(min(poll_interval_s, remaining))
+        entries = _load_entries(transcript_path)
+    return entries
+
+
 def parse_last_turn(transcript_path: str) -> tuple[str, str, list[dict], list[dict]]:
-    """Parse the most recent turn from a Claude Code transcript.
+    """Read a transcript file and parse its most recent turn.
+
+    Thin wrapper over ``parse_entries`` — kept for callers/tests that pass a
+    path. The settle-wait lives in ``main`` (via ``_read_settled_entries``) so
+    a direct ``parse_last_turn`` call parses whatever is on disk immediately.
+    """
+    return parse_entries(_load_entries(transcript_path))
+
+
+def parse_entries(entries: list[dict]) -> tuple[str, str, list[dict], list[dict]]:
+    """Parse the most recent turn from already-loaded transcript entries.
 
     Returns ``(user_prompt, llm_response, tool_activity, subagent_activity)``
     where the activity lists conform to the V2 ``ParsedTurn`` schema (see
@@ -166,7 +321,7 @@ def parse_last_turn(transcript_path: str) -> tuple[str, str, list[dict], list[di
         V1 spec treats them separately.
 
     Algorithm:
-      1. Walk backwards to find the last real user-role message.
+      1. Find the last real user-role message.
       2. Walk forward from there to end-of-file, collecting:
          - assistant ``text`` blocks → ``llm_response`` (concatenated)
          - assistant ``tool_use`` blocks → pending entries keyed on ``id``
@@ -174,42 +329,13 @@ def parse_last_turn(transcript_path: str) -> tuple[str, str, list[dict], list[di
       3. Pending tools with no matching result are emitted with
          ``phase="attempt"`` (the user stopped before the tool resolved).
     """
-    if not transcript_path or not os.path.exists(transcript_path):
-        return "", "", [], []
-
-    try:
-        with open(transcript_path, encoding="utf-8") as f:
-            entries = [json.loads(line) for line in f if line.strip()]
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"post_turn_triage: transcript read failed: {exc}", file=sys.stderr)
-        return "", "", [], []
-
-    # Step 1: locate the last real user prompt.
-    last_user_idx: int | None = None
-    user_prompt = ""
-    for i in range(len(entries) - 1, -1, -1):
-        entry = entries[i]
-        if not isinstance(entry, dict):
-            continue
-        msg = entry.get("message") or {}
-        if not isinstance(msg, dict):
-            continue
-        role = msg.get("role")
-        content = msg.get("content")
-        if role == "user" and _is_real_user_message(content):
-            stripped = _strip_injected_blocks(_extract_text(content))
-            if not stripped:
-                # This user message was ENTIRELY harness/hook-injected content
-                # (a task-notification, a system-reminder, or our injected
-                # memory) — not a real prompt. Keep walking back to find the
-                # user's actual typed message.
-                continue
-            user_prompt = stripped
-            last_user_idx = i
-            break
-
+    last_user_idx = _find_last_user_idx(entries)
     if last_user_idx is None:
-        return user_prompt, "", [], []
+        return "", "", [], []
+
+    user_prompt = _strip_injected_blocks(
+        _extract_text((entries[last_user_idx].get("message") or {}).get("content"))
+    )
 
     # Step 2: walk forward, collecting assistant text + tool_use/tool_result pairs.
     assistant_chunks: list[str] = []
@@ -374,6 +500,22 @@ def main() -> int:
     except (TypeError, ValueError):
         timeout = _DEFAULT_TIMEOUT
 
+    # Transcript settle-wait caps (same defensive resolution as ``timeout``):
+    # poll the transcript until the turn is fully flushed before parsing, so a
+    # Stop hook that fires ahead of the final assistant-message flush can't
+    # capture a truncated llm_response. ``timeouts`` is already shape-guarded
+    # to a dict above.
+    # _finite_float rejects non-numeric AND non-finite values — json.loads
+    # accepts bare Infinity/NaN, which would survive float() and make the cap's
+    # ``remaining <= 0`` break unreachable (unbounded poll). Both fall back to
+    # the sane default.
+    settle_max_s = _finite_float(
+        timeouts.get("transcript_settle_max_s"), _DEFAULT_SETTLE_MAX_S
+    )
+    settle_poll_s = _finite_float(
+        timeouts.get("transcript_settle_poll_s"), _DEFAULT_SETTLE_POLL_S
+    )
+
     try:
         event = json.loads(sys.stdin.read() or "{}")
         if not isinstance(event, dict):
@@ -406,8 +548,14 @@ def main() -> int:
     else:
         agent_type = "main"
 
-    user_prompt, llm_response, tool_activity, subagent_activity = parse_last_turn(
-        transcript_path
+    # Wait for the turn to be fully written before parsing (see
+    # _read_settled_entries), then parse the settled entries. This is the ONLY
+    # caller that waits; direct parse_last_turn callers parse immediately.
+    entries = _read_settled_entries(
+        transcript_path, max_wait_s=settle_max_s, poll_interval_s=settle_poll_s
+    )
+    user_prompt, llm_response, tool_activity, subagent_activity = parse_entries(
+        entries
     )
 
     body = {
