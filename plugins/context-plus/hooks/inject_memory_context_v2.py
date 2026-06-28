@@ -121,7 +121,13 @@ def main() -> int:
         # tool-agnostic-adapter contract.
         ctx = data.get("additional_context", "")
         if ctx and isinstance(ctx, str):
-            print(ctx)
+            # Wrap the injected memory in a unique sentinel so the post-turn
+            # Stop hook (post_turn_triage.parse_last_turn) can strip it back out
+            # of the captured user_prompt — otherwise the jargon detector (and
+            # every other post-turn agent) would treat our own injected memory
+            # as the user's typed words. Keep this token in lockstep with
+            # post_turn_triage._INJECTED_BLOCK_PATTERNS.
+            print(f"<cms-injected-context>\n{ctx}\n</cms-injected-context>")
         elif ctx is not None and not isinstance(ctx, str):
             # m1 (hook-runtime-adversary fold-in): the H1 guard above
             # silently drops non-string additional_context values to

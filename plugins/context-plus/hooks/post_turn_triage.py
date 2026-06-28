@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -73,6 +74,38 @@ def _extract_text(content: object) -> str:
                     parts.append(text)
         return "\n".join(parts)
     return ""
+
+
+# Harness/hook-injected blocks that get recorded as role="user" content but are
+# NOT the user's typed words: background-task completion notices, harness system
+# reminders, and our OWN injected memory context (wrapped by
+# inject_memory_context_v2.py). They MUST be stripped from the captured
+# user_prompt — otherwise every post-turn agent (most visibly the jargon
+# detector) treats injected text as the user's prompt and flags/stores its terms.
+# Keep the cms-injected-context token in lockstep with the wrapper printed by
+# inject_memory_context_v2.py.
+_INJECTED_TAGS = ("cms-injected-context", "task-notification", "system-reminder")
+# Strip COMPLETE blocks first — non-greedy so two separate blocks of the same
+# tag don't over-match into one. Then a fallback drops a lone, UNTERMINATED
+# opening tag to end-of-string: a truncated transcript would otherwise leave the
+# whole (closing-tag-less) block in user_prompt — reintroducing the exact leak
+# this guards against. Injected blocks are appended after the user's text, so
+# dropping from a lone opening tag to end is safe.
+_INJECTED_BLOCK_PATTERNS = [
+    re.compile(rf"<{t}>.*?</{t}>", re.DOTALL) for t in _INJECTED_TAGS
+] + [
+    re.compile(rf"<{t}>.*\Z", re.DOTALL) for t in _INJECTED_TAGS
+]
+
+
+def _strip_injected_blocks(text: str) -> str:
+    """Strip harness/hook-injected blocks from a captured user message, leaving
+    the user's genuine typed text only (empty string if it was all injected)."""
+    if not isinstance(text, str):
+        return ""
+    for pat in _INJECTED_BLOCK_PATTERNS:
+        text = pat.sub("", text)
+    return text.strip()
 
 
 def _is_real_user_message(content: object) -> bool:
@@ -164,7 +197,14 @@ def parse_last_turn(transcript_path: str) -> tuple[str, str, list[dict], list[di
         role = msg.get("role")
         content = msg.get("content")
         if role == "user" and _is_real_user_message(content):
-            user_prompt = _extract_text(content)
+            stripped = _strip_injected_blocks(_extract_text(content))
+            if not stripped:
+                # This user message was ENTIRELY harness/hook-injected content
+                # (a task-notification, a system-reminder, or our injected
+                # memory) — not a real prompt. Keep walking back to find the
+                # user's actual typed message.
+                continue
+            user_prompt = stripped
             last_user_idx = i
             break
 
