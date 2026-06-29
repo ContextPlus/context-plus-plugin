@@ -105,6 +105,23 @@ def _extract_text(content: object) -> str:
 # Keep the cms-injected-context token in lockstep with the wrapper printed by
 # inject_memory_context_v2.py.
 _INJECTED_TAGS = ("cms-injected-context", "task-notification", "system-reminder")
+# Slash-command echoes and local-command output are ALSO recorded as user-role
+# entries, but isMeta=FALSE — so the sourceToolUseID skip below does not catch
+# them. They are not typed prompts: `/clear`, `/plugin`, `/compact <prose>`, and
+# crucially `/context-plus:cms-connect <project_id> <api_key>` whose
+# <command-args> carries a LIVE cms_live_ credential. Stripping these envelopes
+# empties the entry, so the prompt-finder skips it (see "if not stripped:
+# continue"). Skipping the WHOLE echo (vs stripping one tag) is deliberate — the
+# <command-args> body is the command's argument, not a conversational prompt.
+_COMMAND_TAGS = (
+    "command-name",
+    "command-message",
+    "command-args",
+    "command-contents",
+    "local-command-stdout",
+    "local-command-caveat",
+)
+_STRIP_TAGS = _INJECTED_TAGS + _COMMAND_TAGS
 # Strip COMPLETE blocks first — non-greedy so two separate blocks of the same
 # tag don't over-match into one. Then a fallback drops a lone, UNTERMINATED
 # opening tag to end-of-string: a truncated transcript would otherwise leave the
@@ -112,10 +129,23 @@ _INJECTED_TAGS = ("cms-injected-context", "task-notification", "system-reminder"
 # this guards against. Injected blocks are appended after the user's text, so
 # dropping from a lone opening tag to end is safe.
 _INJECTED_BLOCK_PATTERNS = [
-    re.compile(rf"<{t}>.*?</{t}>", re.DOTALL) for t in _INJECTED_TAGS
+    re.compile(rf"<{t}>.*?</{t}>", re.DOTALL) for t in _STRIP_TAGS
 ] + [
-    re.compile(rf"<{t}>.*\Z", re.DOTALL) for t in _INJECTED_TAGS
+    re.compile(rf"<{t}>.*\Z", re.DOTALL) for t in _STRIP_TAGS
 ]
+
+# Defense-in-depth: a live ContextPlus API key (``cms_live_…``) must never reach
+# the post-turn POST / memory store. The command-envelope strip above already
+# drops the /cms-connect echo that carries it, but redact here too in case a key
+# surfaces in any other captured text (e.g. an assistant reply that echoes it).
+_SECRET_RE = re.compile(r"cms_live_[A-Za-z0-9_\-]+")
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace any ``cms_live_`` API-key token with a redaction marker."""
+    if not isinstance(text, str):
+        return text
+    return _SECRET_RE.sub("cms_live_<redacted>", text)
 
 
 def _strip_injected_blocks(text: str) -> str:
@@ -206,12 +236,30 @@ def _load_entries(transcript_path: str) -> list[dict]:
 
 
 def _find_last_user_idx(entries: list[dict]) -> int | None:
-    """Index of the last REAL user prompt (skipping tool_result messages and
-    entirely harness/hook-injected user-role content). ``None`` if there is no
-    genuine typed prompt in the transcript yet."""
+    """Index of the last REAL user prompt (skipping ``isMeta`` skill/command
+    entries, tool_result messages, and entirely harness/hook-injected user-role
+    content). ``None`` if there is no genuine typed prompt in the transcript
+    yet."""
     for i in range(len(entries) - 1, -1, -1):
         entry = entries[i]
         if not isinstance(entry, dict):
+            continue
+        # Skill/tool invocations inject their result — the /call-agent and
+        # /workflow SKILL.md bodies + agent task args — as user-role messages
+        # flagged ``isMeta: true`` AND carrying ``sourceToolUseID`` (the id of
+        # the Skill/tool_use that produced them). These are NOT the user's
+        # prompt; mining jargon from them captures framework-internal terms
+        # (agent names, MCP routes, skill namespaces) the user never said. Skip
+        # them and keep walking back to the genuine prompt. The sourceToolUseID
+        # guard keeps this NARROW: a bare isMeta prompt with no source tool — an
+        # autonomous /loop tick, a scheduled-routine prompt, a "Continue…"
+        # continuation — IS that turn's real driving prompt and must remain the
+        # boundary (skipping it would mis-attribute the turn to a stale earlier
+        # prompt and bypass the settle-wait). Slash-command echoes and
+        # local-command output (isMeta=FALSE) are handled by the strip-to-empty
+        # path below; injected blocks (task-notification / system-reminder /
+        # cms-injected-context) likewise.
+        if entry.get("isMeta") and entry.get("sourceToolUseID"):
             continue
         msg = entry.get("message") or {}
         if not isinstance(msg, dict):
@@ -453,7 +501,12 @@ def parse_entries(entries: list[dict]) -> tuple[str, str, list[dict], list[dict]
             tool_activity.append(out)
 
     llm_response = "\n".join(assistant_chunks)
-    return user_prompt, llm_response, tool_activity, subagent_activity
+    return (
+        _redact_secrets(user_prompt),
+        _redact_secrets(llm_response),
+        tool_activity,
+        subagent_activity,
+    )
 
 
 def main() -> int:
