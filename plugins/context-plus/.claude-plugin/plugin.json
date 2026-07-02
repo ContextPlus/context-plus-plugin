@@ -1,7 +1,7 @@
 {
   "name": "context-plus",
   "description": "ContextPlus memory system: query-planner memory injection hooks, post-turn triage, dynamic agents, and workflows for Claude Code.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "author": {
     "name": "ContextPlus"
   }

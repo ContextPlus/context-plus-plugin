@@ -6,7 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/inject_memory_context_v2.py\""
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/inject_memory_context_v2.py\"",
+            "timeout": 250
           }
         ]
       }
